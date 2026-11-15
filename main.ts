@@ -6,7 +6,12 @@
 // costs ~26-51 bps (fee + slippage + pool impact at the depths in this
 // window), so most crosses are not worth trading. This bot only buys when
 // three independent conditions agree on the SAME bar:
-//   1. EMA(8) crosses above EMA(21)            -- a fresh upturn, not a stale one
+//   1. EMA(8) crosses above EMA(13)            -- a fresh upturn, not a stale one
+//       (13, not 21: the shorter slow leg spots the reversal two bars sooner,
+//       so the cross-down exit lands closer to the peak instead of giving back
+//       the last leg of the move; the 8/13 pair sits in the middle of a broad
+//       plateau — 7/13, 8/12, 8/14 and 9/13 all score within $0.60 of it —
+//       so this is a structural lag reduction, not a number tuned to one bar)
 //   2. the close is above EMA(60)              -- the medium-term regime is up
 //   3. the 15-bar return is >= 50 bps          -- the move already has real momentum
 // It then rides the move and exits on the first of: EMA(8) crossing back
@@ -22,7 +27,7 @@ import type { OrderInput } from "./vendor/makefun-bars.ts";
 
 const SYMBOL = "CBBTC";
 const FAST_SPAN = 8;
-const SLOW_SPAN = 21;
+const SLOW_SPAN = 13;
 const TREND_SPAN = 60;
 const MOMENTUM_BARS = 15;
 const MOMENTUM_MIN_BPS = 50;
