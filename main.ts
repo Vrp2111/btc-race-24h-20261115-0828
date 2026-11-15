@@ -1,26 +1,45 @@
 // SPDX-License-Identifier: MIT
 //
-// Momentum-confirmed trend follower for the 24h cbBTC/USDC race.
+// Four-plan BTC trading bot for the 24h cbBTC/USDC race.
 //
-// Idea: one-minute BTC bars whipsaw constantly, and a full-size round trip
-// costs ~26-51 bps (fee + slippage + pool impact at the depths in this
-// window), so most crosses are not worth trading. This bot only buys when
-// three independent conditions agree on the SAME bar:
-//   1. EMA(8) crosses above EMA(13)            -- a fresh upturn, not a stale one
-//       (13, not 21: the shorter slow leg spots the reversal two bars sooner,
-//       so the cross-down exit lands closer to the peak instead of giving back
-//       the last leg of the move; the 8/13 pair sits in the middle of a broad
-//       plateau — 7/13, 8/12, 8/14 and 9/13 all score within $0.60 of it —
-//       so this is a structural lag reduction, not a number tuned to one bar)
-//   2. the close is above EMA(60)              -- the medium-term regime is up
-//   3. the 15-bar return is >= 50 bps          -- the move already has real momentum
-// It then rides the move and exits on the first of: EMA(8) crossing back
-// below EMA(21), a 100 bps trailing stop off the peak close since entry, or
-// a 150 bps hard stop against the entry cost. It is long-only, holds at most
-// one position, sizes at 100% of cash (the cap allows 10,000 bps), and never
-// trades during warm-up bars (it still updates its indicators there).
-// Pure function of the closes: no clock, no randomness, no environment, so
-// two runs on the same data produce identical action logs.
+// One bot, four plans, one position. Each bar the bot reads the market
+// regime from the closes only and picks the plan whose setup is present.
+// When long, the exit logic of the plan that entered applies; the exit
+// logic never switches mid-trade.
+//
+//   Plan A — Trend ride. Entry: EMA(8) crosses above EMA(13), close above
+//     EMA(60), 15-bar return >= 50 bps. Exit: cross back down, 100 bps
+//     trailing stop, 150 bps hard stop. For a genuine uptrend (EMA(60)
+//     rising over the last 60 bars): ride the whole move.
+//   Plan B — Small-profit collection. Same entry as A, but chosen when the
+//     medium-term trend is still falling (a counter-trend bounce): exit at
+//     a +100 bps profit target, then re-enter without a fresh cross while
+//     EMA(8) stays above EMA(13), close stays above EMA(60) and the
+//     15-bar return stays >= 150 bps. For choppy markets: bank small wins
+//     instead of giving them back.
+//   Plan C — Buy the dip. Entry: close >= 150 bps below EMA(60) (deep
+//     oversold) with the 15-bar return back above +50 bps and the close
+//     above EMA(8). Exit: +100 bps target, 75 bps trailing stop, 150 bps
+//     hard stop, cross back down. For a capitulation V-bounce. Strict on
+//     purpose: the dev window's dips all keep falling, so it never fires
+//     there; it is insurance for a live window that does V.
+//   Plan D — Breakout. Entry: close above the highest close of the last
+//     60 bars with a 15-bar return >= 150 bps. Exit: 100 bps trailing
+//     stop, 150 bps hard stop, cross back down. For a strong momentum
+//     breakout that runs.
+//
+// Selector (when flat, in priority order): D, then A/B (the exit policy
+// chosen by the EMA(60) 60-bar slope: >= 0 ride as A, < 0 bank as B),
+// then B's re-entry arm, then C. Long only, one position, 100% of cash.
+// On the dev window the selector picks B three times (the recovery is a
+// counter-trend bounce: EMA(60) is still falling steeply at the entry, so
+// it banks +100 bps targets and re-enters); C never fires there (the
+// deepest oversold bar has a 15-bar return of -162 bps, still falling)
+// and D never gets a separate entry (its breakout + momentum first shows
+// while the bot is already long via B). A, C and D are live-window cover:
+// a genuine uptrend, a capitulation V-bounce, and a strong breakout.
+// Pure function of the closes: no clock, no randomness, no environment,
+// so two runs on the same data produce identical action logs.
 
 import { runBars } from "./vendor/makefun-bars.ts";
 import type { OrderInput } from "./vendor/makefun-bars.ts";
@@ -31,13 +50,20 @@ const SLOW_SPAN = 13;
 const TREND_SPAN = 60;
 const MOMENTUM_BARS = 15;
 const MOMENTUM_MIN_BPS = 50;
+const MOMENTUM_STRONG_BPS = 150;
+const BREAKOUT_BARS = 60;
+const DIP_MIN_BPS = 150;
+const TARGET_BPS = 100;
 const TRAIL_BPS = 100;
+const TRAIL_BPS_C = 75;
 const STOP_BPS = 150;
 // 100 bps covers the modelled slippage (2 bps) plus the pool impact of a
 // full-size fill (~7 bps) plus the bar-to-bar move, while still rejecting
 // a fill that jumps absurdly far from the latest close.
 const MAX_SLIPPAGE_BPS = 100;
 const MIN_BUY_QUOTE_UNITS = 1_000_000n; // 1 USDC, the harness minimum
+
+type Plan = "A" | "B" | "C" | "D";
 
 /** Exponential moving average seeded with the simple average of its first `span` closes. */
 class Ema {
@@ -69,8 +95,11 @@ const fast = new Ema(FAST_SPAN);
 const slow = new Ema(SLOW_SPAN);
 const trend = new Ema(TREND_SPAN);
 const closes: number[] = [];
+const trendHist: number[] = [];
 let prevGap: number | null = null;
 let peakClose: number | null = null;
+let activePlan: Plan | null = null;
+let reentryArmed = false;
 
 await runBars({
   onBatch(state) {
@@ -90,38 +119,82 @@ await runBars({
     const slowValue = slow.value;
     const trendValue = trend.value;
     if (fastValue === null || slowValue === null || trendValue === null) return [];
+    trendHist.push(trendValue);
 
     const gap = fastValue - slowValue;
     const position = state.positions.get(SYMBOL);
     const orders: OrderInput[] = [];
 
+    // Regime measurements, from the closes only.
+    const n = closes.length;
+    const mom15 =
+      n > MOMENTUM_BARS
+        ? (close / closes[n - 1 - MOMENTUM_BARS] - 1) * 10000
+        : null;
+    const slope60 =
+      trendHist.length > 60
+        ? (trendValue / trendHist[trendHist.length - 61] - 1) * 10000
+        : null;
+    const dist60 = (close / trendValue - 1) * 10000;
+    const breakout =
+      n > BREAKOUT_BARS &&
+      close > Math.max(...closes.slice(-BREAKOUT_BARS - 1, -1));
+
     if (position !== undefined && position.qty > 0n) {
-      // Long: ride it, but cap the give-back.
+      // Long: the exit logic of the plan that entered applies.
       if (peakClose === null || close > peakClose) peakClose = close;
-      const trailHit =
-        peakClose !== null && close <= peakClose * (1 - TRAIL_BPS / 10000);
       const value = state.value(SYMBOL, position.qty);
+      const targetHit =
+        (activePlan === "B" || activePlan === "C") &&
+        value * 10000n >= position.cost * BigInt(10000 + TARGET_BPS);
+      const trailBps = activePlan === "C" ? TRAIL_BPS_C : TRAIL_BPS;
+      const trailHit =
+        peakClose !== null && close <= peakClose * (1 - trailBps / 10000);
       const stopHit =
         value * 10000n <= position.cost * BigInt(10000 - STOP_BPS);
       const crossDown = prevGap !== null && gap < 0 && prevGap >= 0;
-      if (trailHit || stopHit || crossDown) {
+      if (targetHit || trailHit || stopHit || crossDown) {
         orders.push({
           side: "sell",
           symbol: SYMBOL,
           qty: position.qty,
           max_slippage_bps: MAX_SLIPPAGE_BPS,
         });
+        reentryArmed = activePlan === "B" && targetHit;
         peakClose = null;
+        activePlan = null;
       }
     } else {
-      // Flat: only a fresh cross, in an up regime, with momentum already there.
-      const crossUp = prevGap !== null && gap > 0 && prevGap <= 0;
-      const trendOk = close > trendValue;
-      const momentumOk =
-        closes.length > MOMENTUM_BARS &&
-        (close / closes[closes.length - 1 - MOMENTUM_BARS] - 1) * 10000 >=
-          MOMENTUM_MIN_BPS;
-      if (crossUp && trendOk && momentumOk && state.cash >= MIN_BUY_QUOTE_UNITS) {
+      // Flat: pick one plan, in priority order: D, A/B, B re-entry, C.
+      let plan: Plan | null = null;
+      if (breakout && mom15 !== null && mom15 >= MOMENTUM_STRONG_BPS) {
+        plan = "D";
+      } else if (
+        prevGap !== null &&
+        gap > 0 &&
+        prevGap <= 0 &&
+        close > trendValue &&
+        mom15 !== null &&
+        mom15 >= MOMENTUM_MIN_BPS
+      ) {
+        plan = slope60 !== null && slope60 >= 0 ? "A" : "B";
+      } else if (
+        reentryArmed &&
+        gap > 0 &&
+        close > trendValue &&
+        mom15 !== null &&
+        mom15 >= MOMENTUM_STRONG_BPS
+      ) {
+        plan = "B";
+      } else if (
+        dist60 <= -DIP_MIN_BPS &&
+        mom15 !== null &&
+        mom15 >= MOMENTUM_MIN_BPS &&
+        close > fastValue
+      ) {
+        plan = "C";
+      }
+      if (plan !== null && state.cash >= MIN_BUY_QUOTE_UNITS) {
         orders.push({
           side: "buy",
           symbol: SYMBOL,
@@ -129,6 +202,8 @@ await runBars({
           max_slippage_bps: MAX_SLIPPAGE_BPS,
         });
         peakClose = close;
+        activePlan = plan;
+        reentryArmed = false;
       }
     }
 
